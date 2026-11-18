@@ -10,6 +10,14 @@ K8S_VERSION="1.29"
 
 log() { echo "[$(date '+%H:%M:%S')] worker-$WORKER_ID: $*"; }
 
+# Startup script uruchamia się przy każdym starcie VM (np. po zmianie typu maszyny).
+# Węzeł już dołączony → kubelet wstaje sam z systemd, a ponowny kubeadm join by się nie udał.
+if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+  swapoff -a
+  log "Węzeł już jest w klastrze (/etc/kubernetes/kubelet.conf istnieje) — pomijam instalację i join."
+  exit 0
+fi
+
 # ── 1. System deps ─────────────────────────────────────────────────────────────
 log "Aktualizacja systemu..."
 apt-get update -qq
