@@ -13,6 +13,9 @@ name: Deploy
 # administrator migruje przed pierwszym uruchomieniem:
 #   terraform -chdir=terraform init -migrate-state \
 #     -backend-config="bucket=<TF_STATE_BUCKET>" -backend-config="prefix=<TF_STATE_PREFIX>"
+#
+# UWAGA: artefakt z planem zawiera hasła (metadane VM) i nie jest szyfrowany.
+# W publicznym repo może go pobrać każdy zalogowany użytkownik GitHuba przez 1 dzień.
 
 on:
   workflow_dispatch:
@@ -22,7 +25,7 @@ on:
         type: boolean
         default: false
       run_smoke_test:
-        description: "Sprawdź endpointy Airflow, JupyterHub i Grafany na masterze."
+        description: "Sprawdź bucket DAG-ów i Airflow /health na masterze (tylko z main)."
         type: boolean
         default: false
 
@@ -96,6 +99,9 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="prefix=${TF_STATE_PREFIX}"
 
+      - name: terraform validate
+        run: terraform -chdir=terraform validate -no-color
+
       - name: terraform plan
         run: |
           terraform -chdir=terraform plan -lock-timeout=5m -no-color -out=tfplan
@@ -106,26 +112,29 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
   apply:
     name: Terraform apply
     needs: plan
-    if: inputs.run_apply && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && inputs.run_apply
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: production
+    environment: production # czeka na zatwierdzenie (wymagani recenzenci)
     permissions:
       contents: read
       id-token: write
     env:
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_PREFIX: ${{ vars.TF_STATE_PREFIX }}
-      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
-      TF_VAR_ssh_pub_key: ${{ vars.SSH_PUBLIC_KEY }}
-      TF_VAR_airflow_admin_password: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
-      TF_VAR_airflow_analyst_password: ${{ secrets.AIRFLOW_ANALYST_PASSWORD }}
-      TF_VAR_jupyterhub_admin_password: ${{ secrets.JUPYTERHUB_ADMIN_PASSWORD }}
-      TF_VAR_jupyterhub_analyst_password: ${{ secrets.JUPYTERHUB_ANALYST_PASSWORD }}
-      TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+      # Jedyne outputy wypisywane w logu i podsumowaniu joba.
+      PUBLIC_OUTPUTS: "master_external_ip dag_bucket ssh_command"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -141,26 +150,42 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
+      # Plan z tego samego uruchomienia (bez run-id = bieżący run).
+      - name: Download plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan
+          path: terraform
+
       - name: terraform init
         run: |
           terraform -chdir=terraform init \
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="prefix=${TF_STATE_PREFIX}"
 
-      # Plan liczony ponownie w tym jobie: plik planu zawiera hasła, więc nie
-      # przekazujemy go jako artefaktu między jobami.
-      - name: terraform plan
-        run: terraform -chdir=terraform plan -lock-timeout=5m -no-color -out=tfplan
-
+      # Blok "Outputs:" z apply jest obcinany — outputy wypisuje tylko następny krok.
       - name: terraform apply
-        run: terraform -chdir=terraform apply -lock-timeout=5m -no-color tfplan
+        run: |
+          set -o pipefail
+          terraform -chdir=terraform apply -lock-timeout=5m -no-color tfplan | sed '/^Outputs:/,$d'
+
+      - name: Show outputs
+        run: |
+          echo "### Outputs" >> "$GITHUB_STEP_SUMMARY"
+          for name in $PUBLIC_OUTPUTS; do
+            value=$(terraform -chdir=terraform output -raw "$name")
+            echo "$name = $value"
+            echo "- \`$name\` = \`$value\`" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   smoke-test:
     name: Smoke test
     needs: [plan, apply]
-    # Działa też bez apply — sprawdza wtedy aktualne wdrożenie.
+    # Działa też bez apply (apply pominięty) — sprawdza wtedy aktualne wdrożenie.
     if: >-
-      always() && inputs.run_smoke_test
+      always()
+      && github.ref == 'refs/heads/main'
+      && inputs.run_smoke_test
       && needs.plan.result == 'success'
       && (needs.apply.result == 'success' || needs.apply.result == 'skipped')
     runs-on: ubuntu-24.04
@@ -172,8 +197,8 @@ jobs:
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_PREFIX: ${{ vars.TF_STATE_PREFIX }}
       # Świeży master instaluje wszystko ~10–12 min po apply.
-      FIRST_TIMEOUT_SECONDS: "1200"
-      NEXT_TIMEOUT_SECONDS: "300"
+      HEALTH_TIMEOUT_SECONDS: "1200"
+      HEALTH_INTERVAL_SECONDS: "20"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,34 +214,39 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
-      - name: Read master IP from state
-        id: master
+      - name: Read outputs from state
+        id: tf
         run: |
           terraform -chdir=terraform init \
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="prefix=${TF_STATE_PREFIX}" >/dev/null
-          echo "ip=$(terraform -chdir=terraform output -raw master_external_ip)" >> "$GITHUB_OUTPUT"
+          {
+            echo "master_ip=$(terraform -chdir=terraform output -raw master_external_ip)"
+            echo "dag_bucket=$(terraform -chdir=terraform output -raw dag_bucket)"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Check endpoints
+      # gcloud jest preinstalowany na ubuntu-24.04; auth ustawia mu poświadczenia WIF.
+      - name: Verify DAG bucket
         env:
-          MASTER_IP: ${{ steps.master.outputs.ip }}
+          DAG_BUCKET: ${{ steps.tf.outputs.dag_bucket }}
         run: |
-          set -euo pipefail
-          # wait_for <nazwa> <url> <wyrażenie jq lub "-"> <timeout s>
-          wait_for() {
-            local name=$1 url=$2 check=$3 timeout=$4 deadline body
-            deadline=$(( $(date +%s) + timeout ))
-            while (( $(date +%s) < deadline )); do
-              if body=$(curl -fsS --max-time 10 "$url" 2>/dev/null) \
-                 && { [[ "$check" == "-" ]] || jq -e "$check" <<<"$body" >/dev/null 2>&1; }; then
-                echo "✓ $name OK ($url)"; return 0
-              fi
-              echo "… $name jeszcze niegotowy, ponawiam za 20 s"; sleep 20
-            done
-            echo "::error::$name nie odpowiada poprawnie po ${timeout}s: $url"; return 1
-          }
+          gcloud storage buckets describe "gs://${DAG_BUCKET}" --format="value(name)"
+          echo "✓ Bucket gs://${DAG_BUCKET} istnieje"
 
-          wait_for "Airflow"    "http://${MASTER_IP}:30080/health" \
-            '.metadatabase.status == "healthy" and .scheduler.status == "healthy"' "$FIRST_TIMEOUT_SECONDS"
-          wait_for "JupyterHub" "http://${MASTER_IP}:30088/hub/health" "-" "$NEXT_TIMEOUT_SECONDS"
-          wait_for "Grafana"    "http://${MASTER_IP}:30300/api/health" '.database == "ok"' "$NEXT_TIMEOUT_SECONDS"
+      - name: Airflow /health
+        env:
+          MASTER_IP: ${{ steps.tf.outputs.master_ip }}
+        run: |
+          url="http://${MASTER_IP}:30080/health"
+          deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+          while (( $(date +%s) < deadline )); do
+            if body=$(curl -fsS --max-time 10 "$url" 2>/dev/null) \
+               && jq -e '.metadatabase.status == "healthy" and .scheduler.status == "healthy"' <<<"$body" >/dev/null 2>&1; then
+              echo "✓ Airflow healthy: $body"
+              exit 0
+            fi
+            echo "… Airflow jeszcze niegotowy, ponawiam za ${HEALTH_INTERVAL_SECONDS} s"
+            sleep "$HEALTH_INTERVAL_SECONDS"
+          done
+          echo "::error::Airflow nie jest healthy po ${HEALTH_TIMEOUT_SECONDS}s: $url"
+          exit 1
