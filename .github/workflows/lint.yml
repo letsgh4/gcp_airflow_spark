@@ -1,0 +1,116 @@
+name: Lint
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+# Tylko odczyt repo. Workflow nie używa żadnych sekretów ani tokenów:
+# narzędzia pobierane są z publicznych adresów i weryfikowane sumą SHA-256.
+permissions:
+  contents: read
+
+env:
+  TERRAFORM_VERSION: "1.17.1"
+  TFLINT_VERSION: "0.65.0"
+  TFLINT_SHA256: "d4c545ed2e29d6338604b586f34f544f380f70f243aa72f7b484713835eaec61"
+  TFLINT_GOOGLE_VERSION: "0.41.0" # musi zgadzać się z .tflint.hcl
+  TFLINT_GOOGLE_SHA256: "efb3910bbc9f0b90bebd76d475ca6cd2cf04a032f6cddc8fa7a334e5011da6d6"
+  SHELLCHECK_VERSION: "0.11.0"
+  SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+  PYTHON_VERSION: "3.11"
+  RUFF_VERSION: "0.17.3"
+
+jobs:
+  terraform:
+    name: Terraform (fmt, validate, tflint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate -no-color
+
+      - name: Install TFLint + Google ruleset
+        env:
+          TFLINT_PLUGIN_DIR: ${{ runner.temp }}/tflint-plugins
+        run: |
+          grep -q "version = \"${TFLINT_GOOGLE_VERSION}\"" .tflint.hcl \
+            || { echo "::error file=.tflint.hcl::Wersja wtyczki google różni się od TFLINT_GOOGLE_VERSION=${TFLINT_GOOGLE_VERSION}"; exit 1; }
+
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_amd64.zip"
+          echo "${TFLINT_SHA256}  tflint_linux_amd64.zip" | sha256sum -c -
+          unzip -q tflint_linux_amd64.zip -d "$RUNNER_TEMP/bin"
+
+          plugin_dir="$TFLINT_PLUGIN_DIR/github.com/terraform-linters/tflint-ruleset-google/${TFLINT_GOOGLE_VERSION}"
+          curl -fsSLO "https://github.com/terraform-linters/tflint-ruleset-google/releases/download/v${TFLINT_GOOGLE_VERSION}/tflint-ruleset-google_linux_amd64.zip"
+          echo "${TFLINT_GOOGLE_SHA256}  tflint-ruleset-google_linux_amd64.zip" | sha256sum -c -
+          mkdir -p "$plugin_dir"
+          unzip -q tflint-ruleset-google_linux_amd64.zip -d "$plugin_dir"
+
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: tflint
+        env:
+          TFLINT_PLUGIN_DIR: ${{ runner.temp }}/tflint-plugins
+        run: |
+          tflint --chdir=terraform --config="$GITHUB_WORKSPACE/.tflint.hcl" --version
+          tflint --chdir=terraform --config="$GITHUB_WORKSPACE/.tflint.hcl" --format=compact
+
+  shell:
+    name: ShellCheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck
+        run: |
+          cd "$RUNNER_TEMP"
+          archive="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSLO "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  ${archive}" | sha256sum -c -
+          tar -xJf "$archive"
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck --format=gcc scripts/*.sh
+
+  python:
+    name: Ruff
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Ruff
+        run: python -m pip install --disable-pip-version-check "ruff==${RUFF_VERSION}"
+
+      - name: ruff check
+        run: ruff check --output-format=github .

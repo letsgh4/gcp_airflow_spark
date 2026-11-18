@@ -1,0 +1,13 @@
+target-version = "py311"
+
+[lint]
+select = [
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # Pyflakes
+  "I",  # isort
+  "UP", # pyupgrade
+]
+ignore = [
+  "E501", # długość linii — zostawiamy formatterowi / ocenie autora
+]

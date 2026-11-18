@@ -4,18 +4,20 @@ exec > /var/log/master-init.log 2>&1
 
 META="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
 H="Metadata-Flavor: Google"
+# shellcheck disable=SC2034  # TODO: nieużywane — usunąć albo wykorzystać
 PROJECT_ID=$(curl -sf "$META/tf_project_id" -H "$H")
 JOIN_BUCKET=$(curl -sf "$META/tf_join_bucket" -H "$H")
+# shellcheck disable=SC2034  # TODO: przekazać do JupyterHub jako DAG_BUCKET (wymaga go notebooks/airflow_helper.py)
 DAG_BUCKET=$(curl -sf  "$META/tf_dag_bucket"  -H "$H")
 ANALITYCY=$(curl -sf    "$META/tf_analitycy"     -H "$H")
 AIRFLOW_ADMIN_PASSWORD=$(curl -sf "$META/tf_airflow_admin_password" -H "$H")
 AIRFLOW_ANALYST_PASSWORD=$(curl -sf "$META/tf_airflow_analyst_password" -H "$H")
+# shellcheck disable=SC2034  # TODO: hasło admina JupyterHub nie jest nigdzie ustawiane
 JUPYTERHUB_ADMIN_PASSWORD=$(curl -sf "$META/tf_jupyterhub_admin_password" -H "$H")
 JUPYTERHUB_ANALYST_PASSWORD=$(curl -sf "$META/tf_jupyterhub_analyst_password" -H "$H")
 GRAFANA_ADMIN_PASSWORD=$(curl -sf "$META/tf_grafana_admin_password" -H "$H")
 
 K8S_VERSION="1.29"
-AIRFLOW_VERSION="2.9.1"
 POD_CIDR="192.168.0.0/16"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -188,8 +190,6 @@ EOF
 log "Instalacja Apache Airflow via Helm..."
 helm repo add apache-airflow https://airflow.apache.org
 helm repo update
-
-ADMIN_PASSWORD="Spark@Adm1n2024!"
 
 # hostPath — katalog DAGów z mastera montowany bezpośrednio do podów.
 # Wszystkie komponenty Airflow (w tym KubernetesExecutor worker pods) pinowane
@@ -801,7 +801,7 @@ log "Wgrywanie reguł alertów Airflow..."
 kubectl apply -f /tmp/airflow-alerts.yaml
 
 log "Monitoring gotowy:"
-log "  Grafana:    http://$EXTERNAL_IP:30300  (admin / Gr@fana#K8s$2024!xQ)"
+log "  Grafana:    http://$EXTERNAL_IP:30300  (admin / hasło z GRAFANA_ADMIN_PASSWORD)"
 log "  Prometheus: http://$EXTERNAL_IP:30090"
 
 # ── Gotowe ─────────────────────────────────────────────────────────────────────
@@ -810,8 +810,8 @@ EXTERNAL_IP=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/insta
 
 log "========================================"
 log "SETUP ZAKOŃCZONY"
-log "Airflow UI:    http://$EXTERNAL_IP:30080  (admin / $ADMIN_PASSWORD)"
-log "JupyterHub:    http://$EXTERNAL_IP:30088  (analityk01..16 / JupyterCourse2024!)"
-log "Grafana:       http://$EXTERNAL_IP:30300  (admin / Gr@fana#K8s$2024!xQ)"
+log "Airflow UI:    http://$EXTERNAL_IP:30080  (admin / hasło z AIRFLOW_ADMIN_PASSWORD)"
+log "JupyterHub:    http://$EXTERNAL_IP:30088  (analityk01..16 / hasło z JUPYTERHUB_ANALYST_PASSWORD)"
+log "Grafana:       http://$EXTERNAL_IP:30300  (admin / hasło z GRAFANA_ADMIN_PASSWORD)"
 log "Prometheus:    http://$EXTERNAL_IP:30090"
 log "========================================"

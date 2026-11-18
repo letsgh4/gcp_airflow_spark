@@ -21,6 +21,7 @@ if [[ ! -f "$PROJECT_ROOT/.env" ]]; then
   exit 1
 fi
 
+# shellcheck source=/dev/null  # .env jest lokalny i nie ma go w repo
 source "$PROJECT_ROOT/.env"
 
 # Weryfikuj wymagane zmienne

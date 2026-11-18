@@ -36,7 +36,7 @@ How the rules match:
 - Script rules cover `./scripts/x.sh`, `scripts/x.sh`, `./x.sh`, absolute paths, and `bash`/`sh`/`source`/`.`.
 - Commands joined with `&&`, `;` or `|` are checked part by part, so `cd terraform && terraform apply` is denied too.
 
-A few read-only commands are also caught because they contain a mutating verb as a word: `kubectl auth can-i delete …`, `kubectl get pods -L label`, `bash -n scripts/deploy.sh`. Use another form, such as `bash -n scripts/*.sh`.
+A few read-only commands are also caught because they contain a mutating verb as a word: `kubectl auth can-i delete …`, `kubectl get pods -L label`, `bash -n scripts/deploy.sh`, and any command whose text has ` .env` as a separate word, such as `git commit -m "… .env …"`. Use another form, such as `bash -n scripts/*.sh` or `git commit -F <file>`.
 
 These rules are a guardrail, not a security boundary: they can't catch every shell form, and `ssh` to the master is not blocked. The real control is that only GitHub Actions holds deploy credentials. To change the list, edit `.claude/settings.json` in a PR. Keep `!.claude/settings.json` in `.gitignore`, because `*.json` is ignored globally.
 
@@ -44,19 +44,24 @@ These rules are a guardrail, not a security boundary: they can't catch every she
 
 ### Lint
 
-Only `terraform` is installed by default. Install the other tools as needed.
+CI (`.github/workflows/lint.yml`) runs on every PR to `main` and can be reused through `workflow_call`. It runs terraform fmt/validate, TFLint, ShellCheck and Ruff. The workflow uses no secrets: tools are downloaded from public release URLs and checked against SHA-256 sums. The tool versions and checksums live in its `env:` block.
+
+When bumping the Google ruleset, update `TFLINT_GOOGLE_VERSION` and its checksum in the workflow together with `.tflint.hcl`; CI fails if they differ. Ruff config is in `ruff.toml`: py311, rules `E W F I UP`, `E501` ignored.
+
+Only `terraform` is installed locally by default. Install the other tools as needed. To run the same checks locally:
 
 ```bash
 terraform -chdir=terraform fmt -check -recursive
 terraform -chdir=terraform init -backend=false && terraform -chdir=terraform validate
-tflint --chdir=terraform
+tflint --init && tflint --chdir=terraform --config="$PWD/.tflint.hcl"
 
 shellcheck scripts/*.sh
 bash -n scripts/*.sh                       # syntax only, needs no extra tools
 
-ruff check dags/ notebooks/ stress_test.py
+ruff check .                               # ruff check --fix . sorts imports
 python3 -m py_compile dags/*.py notebooks/airflow_helper.py
 
+# Not in CI yet:
 yamllint helm/ k8s/
 helm lint helm/airflow -f helm/airflow/values-green.yaml   # values files only; there is no Chart.yaml in the repo
 kubeconform -summary -ignore-missing-schemas k8s/   # `kubectl apply --dry-run` is blocked by the deny rules
