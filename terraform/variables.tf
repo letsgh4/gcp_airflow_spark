@@ -49,8 +49,19 @@ variable "allowed_cidr" {
   default     = "0.0.0.0/0"
 }
 
+variable "ssh_pub_key" {
+  description = "Publiczny klucz SSH (treść). W CI z vars.SSH_PUBLIC_KEY; puste = odczyt z ssh_pub_key_path."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.ssh_pub_key == "" || can(regex("^(ssh-|ecdsa-)", trimspace(var.ssh_pub_key)))
+    error_message = "ssh_pub_key musi być publicznym kluczem OpenSSH (np. \"ssh-ed25519 AAAA...\")."
+  }
+}
+
 variable "ssh_pub_key_path" {
-  description = "Ścieżka do publicznego klucza SSH"
+  description = "Ścieżka do publicznego klucza SSH — fallback dla lokalnego developmentu, gdy ssh_pub_key jest puste"
   type        = string
   default     = "~/.ssh/id_ed25519.pub"
 }
