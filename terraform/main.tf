@@ -6,6 +6,11 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # Stan w GCS. Bucket i prefix podawane przy init (partial configuration):
+  #   terraform init -backend-config="bucket=<bucket>" -backend-config="prefix=<prefix>"
+  # Lint/validate bez dostępu do GCP: terraform init -backend=false
+  backend "gcs" {}
 }
 
 provider "google" {

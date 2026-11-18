@@ -17,7 +17,8 @@ resource "google_service_account" "vm_sa" {
 # }
 
 locals {
-  ssh_pub_key = file(pathexpand(var.ssh_pub_key_path))
+  # Klucz ze zmiennej (CI), a gdy pusta — z pliku lokalnego. file() liczone tylko w gałęzi fallback.
+  ssh_pub_key = trimspace(var.ssh_pub_key != "" ? var.ssh_pub_key : file(pathexpand(var.ssh_pub_key_path)))
   common_metadata = {
     ssh-keys               = "ubuntu:${local.ssh_pub_key}"
     block-project-ssh-keys = "true"

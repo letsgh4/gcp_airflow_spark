@@ -22,7 +22,7 @@ There is no application build or test suite. Changes are checked with the linter
 
 | Area | Blocked | Still allowed |
 |---|---|---|
-| Terraform | `apply`, `destroy`, `import`, `refresh`, `taint`/`untaint`, `force-unlock`, `state rm/mv/push/replace-provider`, `workspace new/delete` | `init`, `fmt`, `validate`, `plan`, `output`, `show`, `state list/show` |
+| Terraform | `apply`, `destroy`, `import`, `refresh`, `taint`/`untaint`, `force-unlock`, `state rm/mv/push/replace-provider`, `workspace new/delete`, `init -migrate-state`/`-force-copy` | `init`, `fmt`, `validate`, `plan`, `output`, `show`, `state list/show` |
 | gcloud | `create`, `delete`, `update`, `patch`, `set`, `start`/`stop`, `deploy`, `enable`/`disable`, `cp`/`mv`/`rm`/`rsync`/`scp` and other mutating verbs, plus every `add-*`, `remove-*`, `set-*`, `attach-*`, `detach-*` | `list`, `describe`, `--help`, `config list`, `ssh` |
 | gsutil | `cp`, `mv`, `rm`, `rsync`, `mb`, `rb`, `compose`, `setmeta`, `defacl`, `retention`, `kms`, and the `set`/`ch`/`create`/`delete` subcommands (`acl set`, `iam ch`, `notification create` …) | `ls`, `cat`, `du`, `stat`, `version`, `acl get`, `iam get` |
 | kubectl | `apply` (including `--dry-run`), `create`, `delete`, `edit`, `patch`, `replace`, `scale`, `set`, `label`, `annotate`, `drain`/`cordon`, `run`, `exec`, `cp`, `attach`, `debug`, `rollout restart/undo/pause/resume` … | `get`, `describe`, `logs`, `top`, `rollout status`, `port-forward` |
@@ -67,12 +67,36 @@ helm lint helm/airflow -f helm/airflow/values-green.yaml   # values files only; 
 kubeconform -summary -ignore-missing-schemas k8s/   # `kubectl apply --dry-run` is blocked by the deny rules
 ```
 
-### Read-only
+### Deploy (GitHub Actions only)
 
-These are safe to run locally.
+`.github/workflows/deploy.yml` is started by hand (`workflow_dispatch`).
+- **Order:** lint (through `workflow_call`) → `terraform plan` → optionally `apply` → optionally a smoke test.
+- **Inputs:** `run_apply` and `run_smoke_test` are both off by default, so a plain run only lints and plans.
+- **Apply** runs only from `main`, in the `production` environment, and re-plans before applying, because the plan file contains passwords and is never passed between jobs as an artifact.
+- **Smoke test** reads the master IP from state and polls Airflow `/health`, JupyterHub `/hub/health` and Grafana `/api/health`. It can run without apply, to check the current deployment.
+
+Configuration:
+- **GCP auth:** Workload Identity Federation (`vars.GCP_WORKLOAD_IDENTITY_PROVIDER`, `vars.GCP_SERVICE_ACCOUNT`); there are no JSON keys.
+- **Inputs passed as `TF_VAR_*`:** `vars.GCP_PROJECT_ID`, `vars.SSH_PUBLIC_KEY`, and the five `*_PASSWORD` secrets.
+- **Region and zone** use the defaults in `variables.tf`.
+
+State lives in GCS: `backend "gcs" {}` in `terraform/main.tf`, with bucket and prefix passed at init from `vars.TF_STATE_BUCKET` and `vars.TF_STATE_PREFIX`. The state bucket is created outside this Terraform. An administrator migrates any old local state once:
 
 ```bash
-terraform -chdir=terraform plan -var="project_id=$PROJECT_ID" ...   # every *_password var is required and has no default
+terraform -chdir=terraform init -migrate-state -backend-config="bucket=..." -backend-config="prefix=..."
+```
+
+The state holds the passwords (VM metadata), so the bucket must stay private.
+
+SSH key: `var.ssh_pub_key` holds the key contents; CI sets it from `vars.SSH_PUBLIC_KEY`. When it's empty (local development), Terraform reads the file at `var.ssh_pub_key_path` (`~/.ssh/id_ed25519.pub`).
+
+### Read-only
+
+These are safe to run locally. `terraform init` now needs the backend config (or `-backend=false` for validate only), plus GCP credentials with read access to the state bucket.
+
+```bash
+terraform -chdir=terraform init -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="prefix=$TF_STATE_PREFIX"
+terraform -chdir=terraform plan    # needs TF_VAR_project_id and every TF_VAR_*_password (no defaults)
 terraform -chdir=terraform output
 terraform -chdir=terraform show
 
@@ -130,3 +154,4 @@ Only one scheduler may run against the shared Postgres metadata DB at a time, so
 - The "Spark" parts (`stress_test.py` using Spark Connect on `:15002`, the `spark_master_ui` output, the firewall ports 7077/8181/4040) are leftovers. Nothing in the bootstrap deploys Spark.
 - `terraform output airflow_ui` prints port 8080, but the UI is served on NodePort 30080.
 - IAM project roles for the VM service account are commented out in `vms.tf` and are assigned manually with gcloud. Only the bucket-level IAM is in Terraform.
+- `scripts/deploy.sh` and `scripts/destroy.sh` run a bare `terraform init` and don't pass the GCS backend config, so they would prompt for the bucket. They predate the CI-only rule and are kept for reference; deploy through `deploy.yml`.
