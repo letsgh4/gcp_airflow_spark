@@ -70,10 +70,11 @@ kubeconform -summary -ignore-missing-schemas k8s/   # `kubectl apply --dry-run` 
 ### Deploy (GitHub Actions only)
 
 `.github/workflows/deploy.yml` is started by hand (`workflow_dispatch`).
-- **Order:** lint (through `workflow_call`) → `terraform plan` → optionally `apply` → optionally a smoke test.
+- **Order:** lint (through `workflow_call`) → `plan` → optionally `apply` → optionally `smoke-test`.
 - **Inputs:** `run_apply` and `run_smoke_test` are both off by default, so a plain run only lints and plans.
-- **Apply** runs only from `main`, in the `production` environment, and re-plans before applying, because the plan file contains passwords and is never passed between jobs as an artifact.
-- **Smoke test** reads the master IP from state and polls Airflow `/health`, JupyterHub `/hub/health` and Grafana `/api/health`. It can run without apply, to check the current deployment.
+- **plan** runs `init`, `validate` and `plan -out=tfplan`, then uploads `tfplan` as an artifact kept for 1 day. The plan contains the passwords (VM metadata) and is not encrypted, so in a public repo any logged-in GitHub user can download it for that day.
+- **apply** runs only on `main` with `run_apply`. It waits for approval in the `production` environment, downloads `tfplan` from the same run and applies it. The `Outputs:` block of apply is cut; only the outputs listed in `PUBLIC_OUTPUTS` are printed.
+- **smoke-test** runs only on `main` with `run_smoke_test`, after a successful plan, and when apply succeeded or was skipped. It reads `master_external_ip` and `dag_bucket` from state, checks the bucket with `gcloud storage buckets describe`, and polls `http://<IP>:30080/health` for up to 20 minutes, until the metadatabase and the scheduler report healthy.
 
 Configuration:
 - **GCP auth:** Workload Identity Federation (`vars.GCP_WORKLOAD_IDENTITY_PROVIDER`, `vars.GCP_SERVICE_ACCOUNT`); there are no JSON keys.
