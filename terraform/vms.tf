@@ -91,6 +91,9 @@ resource "google_compute_instance" "worker" {
   zone         = each.value.zone
   tags         = ["course-node"]
 
+  # Zmiana machine_type: zatrzymaj, zmień typ i uruchom VM w miejscu zamiast błędu.
+  allow_stopping_for_update = true
+
   scheduling {
     on_host_maintenance = "MIGRATE"
     automatic_restart   = true
