@@ -1,0 +1,222 @@
+name: Deploy
+
+# Ręczne wdrożenie infrastruktury. Domyślnie tylko lint + terraform plan.
+#
+# Wymagana konfiguracja repo (Settings → Secrets and variables → Actions):
+#   Variables: GCP_PROJECT_ID, GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT,
+#              TF_STATE_BUCKET, TF_STATE_PREFIX, SSH_PUBLIC_KEY
+#   Secrets:   AIRFLOW_ADMIN_PASSWORD, AIRFLOW_ANALYST_PASSWORD,
+#              JUPYTERHUB_ADMIN_PASSWORD, JUPYTERHUB_ANALYST_PASSWORD, GRAFANA_ADMIN_PASSWORD
+#   Environment: "production" (job apply) — dodaj w nim wymaganych recenzentów.
+#
+# Bucket na stan tworzy administrator poza tym Terraformem. Istniejący lokalny stan
+# administrator migruje przed pierwszym uruchomieniem:
+#   terraform -chdir=terraform init -migrate-state \
+#     -backend-config="bucket=<TF_STATE_BUCKET>" -backend-config="prefix=<TF_STATE_PREFIX>"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_apply:
+        description: "Wykonaj terraform apply (tylko z main). Wyłączone = sam plan."
+        type: boolean
+        default: false
+      run_smoke_test:
+        description: "Sprawdź endpointy Airflow, JupyterHub i Grafany na masterze."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Jeden stan Terraform — nigdy dwa wdrożenia naraz, bez przerywania trwającego.
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.17.1" # ta sama wersja co w lint.yml
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  lint:
+    name: Lint
+    uses: ./.github/workflows/lint.yml
+    permissions:
+      contents: read
+
+  plan:
+    name: Terraform plan
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation — bez kluczy JSON
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_PREFIX: ${{ vars.TF_STATE_PREFIX }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_ssh_pub_key: ${{ vars.SSH_PUBLIC_KEY }}
+      TF_VAR_airflow_admin_password: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+      TF_VAR_airflow_analyst_password: ${{ secrets.AIRFLOW_ANALYST_PASSWORD }}
+      TF_VAR_jupyterhub_admin_password: ${{ secrets.JUPYTERHUB_ADMIN_PASSWORD }}
+      TF_VAR_jupyterhub_analyst_password: ${{ secrets.JUPYTERHUB_ANALYST_PASSWORD }}
+      TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check configuration
+        run: |
+          missing=0
+          for v in TF_STATE_BUCKET TF_STATE_PREFIX TF_VAR_project_id TF_VAR_ssh_pub_key \
+                   TF_VAR_airflow_admin_password TF_VAR_airflow_analyst_password \
+                   TF_VAR_jupyterhub_admin_password TF_VAR_jupyterhub_analyst_password \
+                   TF_VAR_grafana_admin_password; do
+            if [[ -z "${!v}" ]]; then echo "::error::Brak wartości dla $v (zmienna/sekret repo)"; missing=1; fi
+          done
+          exit "$missing"
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform -chdir=terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${TF_STATE_PREFIX}"
+
+      - name: terraform plan
+        run: |
+          terraform -chdir=terraform plan -lock-timeout=5m -no-color -out=tfplan
+          {
+            echo "### Terraform plan"
+            echo '```'
+            terraform -chdir=terraform show -no-color tfplan | grep -E '^(Plan:|No changes|Changes to Outputs)' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Terraform apply
+    needs: plan
+    if: inputs.run_apply && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_PREFIX: ${{ vars.TF_STATE_PREFIX }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_ssh_pub_key: ${{ vars.SSH_PUBLIC_KEY }}
+      TF_VAR_airflow_admin_password: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+      TF_VAR_airflow_analyst_password: ${{ secrets.AIRFLOW_ANALYST_PASSWORD }}
+      TF_VAR_jupyterhub_admin_password: ${{ secrets.JUPYTERHUB_ADMIN_PASSWORD }}
+      TF_VAR_jupyterhub_analyst_password: ${{ secrets.JUPYTERHUB_ANALYST_PASSWORD }}
+      TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform -chdir=terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${TF_STATE_PREFIX}"
+
+      # Plan liczony ponownie w tym jobie: plik planu zawiera hasła, więc nie
+      # przekazujemy go jako artefaktu między jobami.
+      - name: terraform plan
+        run: terraform -chdir=terraform plan -lock-timeout=5m -no-color -out=tfplan
+
+      - name: terraform apply
+        run: terraform -chdir=terraform apply -lock-timeout=5m -no-color tfplan
+
+  smoke-test:
+    name: Smoke test
+    needs: [plan, apply]
+    # Działa też bez apply — sprawdza wtedy aktualne wdrożenie.
+    if: >-
+      always() && inputs.run_smoke_test
+      && needs.plan.result == 'success'
+      && (needs.apply.result == 'success' || needs.apply.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_PREFIX: ${{ vars.TF_STATE_PREFIX }}
+      # Świeży master instaluje wszystko ~10–12 min po apply.
+      FIRST_TIMEOUT_SECONDS: "1200"
+      NEXT_TIMEOUT_SECONDS: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Read master IP from state
+        id: master
+        run: |
+          terraform -chdir=terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${TF_STATE_PREFIX}" >/dev/null
+          echo "ip=$(terraform -chdir=terraform output -raw master_external_ip)" >> "$GITHUB_OUTPUT"
+
+      - name: Check endpoints
+        env:
+          MASTER_IP: ${{ steps.master.outputs.ip }}
+        run: |
+          set -euo pipefail
+          # wait_for <nazwa> <url> <wyrażenie jq lub "-"> <timeout s>
+          wait_for() {
+            local name=$1 url=$2 check=$3 timeout=$4 deadline body
+            deadline=$(( $(date +%s) + timeout ))
+            while (( $(date +%s) < deadline )); do
+              if body=$(curl -fsS --max-time 10 "$url" 2>/dev/null) \
+                 && { [[ "$check" == "-" ]] || jq -e "$check" <<<"$body" >/dev/null 2>&1; }; then
+                echo "✓ $name OK ($url)"; return 0
+              fi
+              echo "… $name jeszcze niegotowy, ponawiam za 20 s"; sleep 20
+            done
+            echo "::error::$name nie odpowiada poprawnie po ${timeout}s: $url"; return 1
+          }
+
+          wait_for "Airflow"    "http://${MASTER_IP}:30080/health" \
+            '.metadatabase.status == "healthy" and .scheduler.status == "healthy"' "$FIRST_TIMEOUT_SECONDS"
+          wait_for "JupyterHub" "http://${MASTER_IP}:30088/hub/health" "-" "$NEXT_TIMEOUT_SECONDS"
+          wait_for "Grafana"    "http://${MASTER_IP}:30300/api/health" '.database == "ok"' "$NEXT_TIMEOUT_SECONDS"

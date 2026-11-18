@@ -54,6 +54,8 @@
       "Bash(terraform workspace delete *)",
       "Bash(terraform * workspace delete)",
       "Bash(terraform * workspace delete *)",
+      "Bash(terraform * -migrate-state*)",
+      "Bash(terraform * -force-copy*)",
       "Bash(gcloud * create)",
       "Bash(gcloud * create *)",
       "Bash(gcloud * delete)",
